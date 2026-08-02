@@ -46,7 +46,12 @@ jobs:
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
-          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          # gpg meldet beim Import auch dann einen Fehlercode, wenn der
+          # Schlüssel sauber gelandet ist (eine überzählige Zeile im Secret
+          # genügt für "invalid armor header"). Maßgeblich ist deshalb
+          # nicht sein Exit-Code, sondern ob danach ein privater Schlüssel
+          # im Schlüsselbund liegt.
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import || true
           KEY="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')"
           [ -n "$KEY" ] || { echo "Kein privater Schlüssel importiert"; exit 1; }
           echo "GPG_KEY_ID=$KEY" >> "$GITHUB_ENV"
