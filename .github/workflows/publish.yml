@@ -1,0 +1,91 @@
+# Baut aus pool/<kanal>/*.deb das signierte apt-Repository und
+# veröffentlicht es über GitHub Pages.
+#
+# Ausgelöst wird der Lauf, wenn der ISO-Build im (privaten) Hauptrepo neue
+# Pakete hierher committet. Der Quellcode bleibt dort privat – öffentlich
+# ist nur, was ohnehin auf jedem Gerät landet: die .deb-Dateien.
+name: Repository veröffentlichen
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pool/**"
+      - "tools/**"
+      - ".github/workflows/publish.yml"
+  workflow_dispatch:
+
+# Nur ein Lauf gleichzeitig: zwei parallele Läufe würden sich beim
+# Aufräumen des Pools und beim Deploy gegenseitig überschreiben.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: write # alte Paketversionen aus pool/ committen
+  pages: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: dpkg-dev installieren
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends dpkg-dev
+
+      # Der private Schlüssel liegt ausschließlich als Secret vor und wird
+      # nur in diesen Runner importiert. Er steht nirgends im Repository –
+      # dort liegt allein der öffentliche Teil (key.asc), den die Geräte
+      # zum Prüfen brauchen.
+      - name: Signaturschlüssel importieren
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          KEY="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')"
+          [ -n "$KEY" ] || { echo "Kein privater Schlüssel importiert"; exit 1; }
+          echo "GPG_KEY_ID=$KEY" >> "$GITHUB_ENV"
+          echo "Signiere mit $KEY"
+
+      - name: Repository bauen und signieren
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: tools/build-repo.sh
+
+      # Sicherheitsnetz: ein unsigniertes Repository darf nie online gehen.
+      # Ohne InRelease würde apt auf jedem Gerät die Quelle verweigern –
+      # besser, der Lauf scheitert hier sichtbar.
+      - name: Signatur prüfen
+        run: |
+          for channel in beta stable; do
+            f="_site/dists/$channel/InRelease"
+            [ -f "$f" ] || { echo "$f fehlt"; exit 1; }
+            gpg --verify "$f" >/dev/null 2>&1 || { echo "$f ist nicht gültig signiert"; exit 1; }
+            echo "$channel: signiert und gültig"
+          done
+
+      # Das Aufräumen alter Versionen passiert im Arbeitsverzeichnis –
+      # zurückcommitten, sonst wächst das Repository mit jedem RC.
+      - name: Aufgeräumten Pool zurückschreiben
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- pool; then
+            git add pool
+            git commit -m "chore: alte Paketversionen aus dem Pool entfernt"
+            git push
+          else
+            echo "Nichts aufzuräumen."
+          fi
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4
